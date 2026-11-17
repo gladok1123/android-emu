@@ -1,0 +1,24 @@
+[package]
+name = "android-emu"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Lightweight Android emulator shell for Windows (QEMU + Android-x86, custom images)"
+authors = ["android-emu contributors"]
+license = "MIT"
+repository = "https://github.com/gladok1123/android-emu"
+readme = "README.md"
+
+[[bin]]
+name = "android-emu"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0

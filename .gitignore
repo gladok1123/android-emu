@@ -1,0 +1,5 @@
+/target
+/android-emu.exe
+*.pdb
+*.part
+.DS_Store
