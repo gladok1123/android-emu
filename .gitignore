@@ -1,5 +1,7 @@
 /target
-/android-emu.exe
+# the release binary is kept in the repo so it can be downloaded without
+# relying on release-asset uploads; rebuilds should be committed explicitly
+# /android-emu.exe
 *.pdb
 *.part
 .DS_Store
