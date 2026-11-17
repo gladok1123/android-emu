@@ -28,6 +28,10 @@ pub struct Settings {
     pub adb_port: u16,
     /// Keep the emulator window on top.
     pub always_on_top: bool,
+    /// Enable ARM translation (libhoudini / libndk) for ARM-only apps.
+    pub arm_translation: bool,
+    /// Resize the QEMU window to the per-app window size after boot.
+    pub apply_window_size: bool,
 }
 
 impl Default for Settings {
@@ -44,6 +48,8 @@ impl Default for Settings {
             autostart_vm: true,
             adb_port: 5600,
             always_on_top: false,
+            arm_translation: true,
+            apply_window_size: true,
         }
     }
 }
@@ -97,6 +103,12 @@ impl Settings {
         if let Some(x) = v.get("alwaysOnTop").and_then(|x| x.as_bool()) {
             s.always_on_top = x;
         }
+        if let Some(x) = v.get("armTranslation").and_then(|x| x.as_bool()) {
+            s.arm_translation = x;
+        }
+        if let Some(x) = v.get("applyWindowSize").and_then(|x| x.as_bool()) {
+            s.apply_window_size = x;
+        }
         s
     }
 
@@ -113,6 +125,8 @@ impl Settings {
         v.set("autostartVm", Value::Bool(self.autostart_vm));
         v.set("adbPort", Value::Int(self.adb_port as i64));
         v.set("alwaysOnTop", Value::Bool(self.always_on_top));
+        v.set("armTranslation", Value::Bool(self.arm_translation));
+        v.set("applyWindowSize", Value::Bool(self.apply_window_size));
         v
     }
 
@@ -361,6 +375,11 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arm_translation_defaults_on() {
+        assert!(Settings::default().arm_translation);
+    }
 
     #[test]
     fn default_settings_are_sane() {

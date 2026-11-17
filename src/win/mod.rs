@@ -1,5 +1,5 @@
 //! Windows-specific integration: shortcuts (`.lnk`), file associations,
-//! extracted icons, registry access and Win32 FFI declarations.
+//! registry access, the native GUI and Win32 FFI declarations.
 
 #[cfg(windows)]
 pub mod ffi;
@@ -15,6 +15,15 @@ pub mod known_folders;
 
 #[cfg(windows)]
 pub mod system;
+
+#[cfg(windows)]
+pub mod gui;
+
+#[cfg(windows)]
+pub mod elevate;
+
+#[cfg(windows)]
+pub mod window;
 
 /// Console helpers exist on every platform (no-ops elsewhere).
 #[cfg(windows)]

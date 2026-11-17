@@ -426,6 +426,24 @@ impl AdbClient {
         }
     }
 
+    /// Copy a local file to the guest.
+    pub fn push(&self, local: &Path, remote: &str) -> Result<String, String> {
+        let out = self
+            .base_cmd()
+            .arg("push")
+            .arg(local)
+            .arg(remote)
+            .output()
+            .map_err(|e| e.to_string())?;
+        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        if out.status.success() {
+            Ok(text.trim().to_string())
+        } else {
+            Err(text.trim().to_string())
+        }
+    }
+
     pub fn start_activity(&self, component: &str) -> Result<String, QemuError> {
         self.shell(&format!(
             "am start -W -n {} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER",
@@ -444,6 +462,13 @@ pub fn find_adb() -> Option<PathBuf> {
         let p = PathBuf::from(configured);
         if p.is_file() {
             return Some(p);
+        }
+    }
+    let configured = crate::config::Settings::load().adb_path;
+    if !configured.is_empty() {
+        let path = PathBuf::from(&configured);
+        if path.is_file() {
+            return Some(path);
         }
     }
     let managed = crate::paths::adb_dir().join("adb.exe");

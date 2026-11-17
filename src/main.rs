@@ -13,6 +13,7 @@ mod axml;
 mod cli;
 mod config;
 mod coordinator;
+mod arm;
 mod inflate;
 mod installer;
 mod json;
@@ -25,6 +26,23 @@ mod util;
 mod win;
 mod zip;
 
+/// Start the native UI, or focus it when it is already open.
+fn gui_entry() -> i32 {
+    #[cfg(windows)]
+    {
+        if win::gui::focus_existing() {
+            return 0;
+        }
+        win::gui::run()
+    }
+    #[cfg(not(windows))]
+    {
+        println!("The graphical interface is only available on Windows.");
+        println!("Use the command line instead, e.g.: android-emu --install app.apk");
+        1
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Shortcut/double-click launches should not show a console window; commands
@@ -36,9 +54,9 @@ fn main() {
     if from_explorer {
         win::console::hide_console_if_owning();
     }
-    if args.is_empty() {
-        cli::print_help_public();
-        return;
+    // No arguments (or `gui`/`--ui`) opens the settings window.
+    if args.is_empty() || matches!(args[0].as_str(), "gui" | "--gui" | "-g" | "--ui" | "settings") {
+        std::process::exit(gui_entry());
     }
     let code = cli::run(args);
     std::process::exit(code);

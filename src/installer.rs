@@ -1,6 +1,8 @@
 //! Turning an APK into a Windows "program": install, shortcut, launch.
 
 use crate::qemu::{self, AdbClient, QemuError, QemuInstall, QemuSession};
+#[cfg(windows)]
+use crate::store::DisplayMode;
 use crate::store::{self, AppEntry, InstallOptions};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -186,6 +188,47 @@ pub fn launch_app(entry: &AppEntry, wait_for_boot: bool) -> Result<(), Installer
             }
         } else {
             println!("adb not found - Android is running, install platform-tools to auto-start apps");
+        }
+    }
+
+    // Give the guest a moment to finish booting, then shape the QEMU window to
+    // the size configured for this app and (optionally) enable ARM translation.
+    let settings = crate::config::Settings::load();
+    let pid = match &state {
+        crate::coordinator::SessionState::Started(session) => Some(session.pid()),
+        crate::coordinator::SessionState::Attached(info) => Some(info.pid),
+    };
+    if let Some(pid) = pid {
+        #[cfg(windows)]
+        {
+            if let Some(hwnd) = crate::win::window::wait_for_window(pid, std::time::Duration::from_secs(90)) {
+                let mode = match entry.display_mode {
+                    DisplayMode::Fullscreen => crate::win::window::WindowMode::BorderlessFullscreen,
+                    DisplayMode::Headless => crate::win::window::WindowMode::Normal,
+                    DisplayMode::Window => {
+                        crate::win::window::WindowMode::Resize(entry.window_width, entry.window_height)
+                    }
+                };
+                if settings.apply_window_size {
+                    crate::win::window::apply_mode(hwnd, mode);
+                }
+                if settings.always_on_top {
+                    let _ = crate::win::window::focus(hwnd);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = pid;
+    }
+
+    if settings.arm_translation {
+        if let Ok(info) = crate::apk::parse_apk(&entry.apk_path()) {
+            if crate::arm::needs_translation(&info) {
+                println!("{}", crate::arm::describe_apk(&info));
+                if let Some(message) = crate::arm::prepare_for_app(port, &info, true) {
+                    println!("{message}");
+                }
+            }
         }
     }
 

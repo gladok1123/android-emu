@@ -43,6 +43,7 @@ pub fn run(args: Vec<String>) -> i32 {
         "image" | "images" => cmd_image(rest),
         "setup" => cmd_setup(rest),
         "doctor" | "check" => cmd_doctor(),
+        "arm" => cmd_arm(rest),
         "assoc" => cmd_assoc(rest),
         "open" | "launch" => cmd_open(rest),
         "adb" => cmd_adb(rest),
@@ -123,11 +124,18 @@ ANDROID IMAGES
   image overlay [name]        Create a writable per-app overlay for persistence
 
 SETUP
+  gui                         Open the settings window (also: no arguments)
   setup                       Enable .apk file association (double-click install)
   setup --download-qemu       Explain how to obtain QEMU (link + expected layout)
   assoc on|off|status         Manage the .apk association
   doctor                      Diagnose QEMU, acceleration, adb and images
   adb <args>                  Run adb against the running emulator
+
+ARM APPLICATIONS
+  arm status                  Is ARM translation (libhoudini/libndk) active in the guest?
+  arm enable                  Try to switch ARM translation on inside the guest
+  arm install <module.zip>    Install a libndk/houdini module through Magisk
+  arm check <file.apk>        Does this APK contain only ARM code?
 
 Everything is stored in %LOCALAPPDATA%\android-emu.
 "#,
@@ -753,6 +761,80 @@ fn cmd_phone(args: Vec<String>) -> CmdResult {
     }
 }
 
+/// `android-emu arm status|enable|install <module.zip>`
+///
+/// ARM-only APKs cannot execute on x86 Android without a translator. These
+/// commands inspect and configure libhoudini (Android-x86/BlissOS) or libndk
+/// (BlissOS 12+) inside the running guest.
+fn cmd_arm(args: Vec<String>) -> CmdResult {
+    let action = args.first().map(|s| s.as_str()).unwrap_or("status");
+    let settings = Settings::load();
+    let session = crate::coordinator::read_live_session();
+    let port = session.as_ref().map(|s| s.adb_port).unwrap_or(settings.adb_port);
+
+    match action {
+        "status" => {
+            println!("ARM translation is {}", if settings.arm_translation { "enabled" } else { "disabled" });
+            if session.is_none() {
+                println!("Android is not running - start an app first to inspect the guest.");
+                println!("{}", crate::arm::guest_support_hint().unwrap_or_default());
+                return Ok(());
+            }
+            let adb = AdbClient::detect(port).map_err(|e| fail(e))?;
+            adb.connect().map_err(|e| fail(e))?;
+            let status = crate::arm::probe(&adb);
+            println!("adb port:  {port}");
+            println!("abi list:  {}", status.abilist);
+            println!("translator: {}", status.translator.unwrap_or_else(|| "none".into()));
+            println!("ready:     {}", status.translation_ready);
+            if !status.translation_ready {
+                println!("\nRun `android-emu arm enable` to try activating it, or use a");
+                println!("BlissOS/PrimeOS image (houdini/libndk included).");
+            }
+            Ok(())
+        }
+        "enable" | "on" => {
+            let adb = AdbClient::detect(port).map_err(|e| fail(e))?;
+            adb.connect().map_err(|e| fail(e))?;
+            match crate::arm::enable_in_guest(&adb) {
+                Ok(message) => {
+                    println!("{message}");
+                    Ok(())
+                }
+                Err(message) => Err(fail(message)),
+            }
+        }
+        "install" => {
+            let Some(path) = args.get(1) else {
+                return Err(fail(
+                    "usage: android-emu arm install <libndk-or-houdini-module.zip>\n\
+                     (module zips are installed through Magisk inside the guest)",
+                ));
+            };
+            let adb = AdbClient::detect(port).map_err(|e| fail(e))?;
+            adb.connect().map_err(|e| fail(e))?;
+            match crate::arm::install_payload(&adb, std::path::Path::new(path)) {
+                Ok(message) => {
+                    println!("{message}");
+                    Ok(())
+                }
+                Err(message) => Err(fail(message)),
+            }
+        }
+        "check" => {
+            let Some(path) = args.get(1) else {
+                return Err(fail("usage: android-emu arm check <file.apk>"));
+            };
+            let info = crate::apk::parse_apk(std::path::Path::new(path)).map_err(|e| fail(e))?;
+            println!("{} ({})", info.label, info.package);
+            println!("ABIs: {}", if info.abis.is_empty() { "none (pure Java)".to_string() } else { info.abis.join(", ") });
+            println!("{}", crate::arm::describe_apk(&info));
+            Ok(())
+        }
+        other => Err(fail(format!("unknown arm command '{other}' (status|enable|install|check)"))),
+    }
+}
+
 fn cmd_doctor() -> CmdResult {
     println!("android-emu {VERSION} - diagnostics\n");
     println!("data directory: {}", crate::paths::data_dir().display());
@@ -770,6 +852,22 @@ fn cmd_doctor() -> CmdResult {
     match qemu::find_adb() {
         Some(p) => println!("adb:            {}", p.display()),
         None => println!("adb:            NOT FOUND"),
+    }
+    let settings = Settings::load();
+    println!(
+        "ARM apps:       {}",
+        if settings.arm_translation {
+            "translation enabled (libhoudini / libndk in the guest)"
+        } else {
+            "translation disabled - ARM-only APKs will not start"
+        }
+    );
+    if let Some(session) = crate::coordinator::read_live_session() {
+        if let Ok(adb) = AdbClient::detect(session.adb_port) {
+            if let Ok(status) = adb.shell("getprop ro.product.cpu.abilist") {
+                println!("guest abilist:  {}", status.trim());
+            }
+        }
     }
     let registry = ImageRegistry::load();
     match registry.active_image() {
