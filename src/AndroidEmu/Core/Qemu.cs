@@ -66,7 +66,7 @@ namespace AndroidEmu.Core
         public static async Task<VmSession> StartAsync(string qemu, AppSettings settings, string disk,
             string iso, string logsDirectory, CancellationToken cancellation)
         {
-            if (!File.Exists(disk)) throw new FileNotFoundException("Виртуальный диск не найден: " + disk);
+            disk = VirtualDisk.CheckForQemu(disk);
             Directory.CreateDirectory(logsDirectory);
             var log = Path.Combine(logsDirectory, (iso == null ? "android-" : "install-") +
                 DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".log");
@@ -220,27 +220,6 @@ namespace AndroidEmu.Core
                 file.Position = 16 * 2048 + 1;
                 if (file.Read(signature, 0, signature.Length) != signature.Length || Encoding.ASCII.GetString(signature) != "CD001")
                     throw new InvalidDataException("Не найден заголовок ISO 9660. Нужен загрузочный ISO для ПК.");
-            }
-        }
-
-        public static async Task CreateDiskAsync(ICommandRunner runner, string qemuImg, string path, int sizeGiB, CancellationToken cancellation)
-        {
-            if (!AppSettings.ValidDiskSize(sizeGiB)) throw new ArgumentOutOfRangeException(nameof(sizeGiB));
-            Directory.CreateDirectory(Path.GetDirectoryName(path));
-            // Reserve a new file before qemu-img. Never overwrite a prior installation,
-            // even if two operations happen to use the same generated identifier.
-            using (new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
-            try
-            {
-                var result = await runner.RunAsync(qemuImg, new[] { "create", "-f", "qcow2", path, CommandLine.Number(sizeGiB) + "G" },
-                    TimeSpan.FromSeconds(60), cancellation).ConfigureAwait(false);
-                result.RequireSuccess("Не удалось создать виртуальный диск");
-                if (new FileInfo(path).Length == 0) throw new IOException("qemu-img не записал виртуальный диск.");
-            }
-            catch
-            {
-                SettingsStore.TryDelete(path);
-                throw;
             }
         }
     }

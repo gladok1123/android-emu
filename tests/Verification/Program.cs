@@ -34,7 +34,11 @@ namespace AndroidEmu.Verification
                 Test("settings round-trip and disk paths", SettingsRoundTrip);
                 Test("ISO validation", ValidateIso);
                 Test("install versus normal boot QEMU arguments", QemuArguments);
-                Test("safe QCOW2 allocation and cleanup", () => DiskCreation().GetAwaiter().GetResult());
+                Test("local QCOW2 paths only", DiskPathValidation);
+                Test("safe QCOW2 allocation in the chosen folder", () => DiskCreation().GetAwaiter().GetResult());
+                Test("concurrent destination creation never overwritten", () => DiskCollision().GetAwaiter().GetResult());
+                Test("cancelled disk creation leaves no destination", () => DiskCancellation().GetAwaiter().GetResult());
+                Test("QEMU only opens standalone QCOW2 files", StandaloneImageValidation);
                 Test("Windows argument quoting", WindowsQuoting);
                 Test("APK manifest and ABI inspection", ApkMetadata);
                 Test("guest ABI matching", AbiMatching);
@@ -74,11 +78,20 @@ namespace AndroidEmu.Verification
             store.Save(settings);
             var loaded = store.Load();
             Require(loaded.ActiveDisk.Name == disk.Name && loaded.MemoryMb == 6144 && loaded.Cores == 4 && loaded.ForceSoftware, "Settings did not persist");
-            Require(store.DiskPath(disk).EndsWith(disk.Id + ".qcow2", StringComparison.Ordinal), "Wrong disk path");
+            var originalPath = Path.Combine(root, "settings", "disks", disk.Id + ".qcow2");
+            Require(loaded.ActiveDisk.FilePath == null && store.DiskPath(loaded.ActiveDisk) == originalPath, "Legacy disk path changed");
+            var customPath = Path.Combine(root, "Диски, тест", "Мой Android.QCOW2");
+            var custom = new AndroidDisk { Name = "Новый Android", SizeGiB = 64, Id = Guid.NewGuid().ToString("N"), FilePath = customPath };
+            loaded.Disks.Add(custom);
+            loaded.ActiveDiskId = custom.Id;
+            store.Save(loaded);
+            loaded = store.Load();
+            Require(loaded.ActiveDisk.FilePath == customPath && store.DiskPath(loaded.ActiveDisk) == customPath, "Selected disk path not persisted");
+            Require(store.DiskPath(loaded.Disks.Single(d => d.Id == disk.Id)) == originalPath, "Saving a new path moved a legacy disk");
             Throws<InvalidDataException>(() => store.DiskPath(new AndroidDisk { Id = "../another-file" }));
             loaded.ActiveDiskId = Guid.NewGuid().ToString("N");
             Throws<InvalidDataException>(() => store.Save(loaded));
-            Require(store.Load().ActiveDisk.Id == disk.Id, "Failed save changed settings");
+            Require(store.Load().ActiveDisk.Id == custom.Id, "Failed save changed settings");
         }
 
         private static void ValidateIso()
@@ -103,6 +116,7 @@ namespace AndroidEmu.Verification
             Require(Option(install, "-m") == "6144" && Option(install, "-smp") == "4", "Settings not applied to QEMU");
             Require(install.Contains("file=" + disk.Replace(",", ",,") + ",format=qcow2,if=ide,index=0"), "Wrong destination arguments");
             Require(install.Contains("file=" + iso.Replace(",", ",,") + ",format=raw,if=ide,index=2,media=cdrom,readonly=on"), "ISO not attached read-only");
+            Require(install.Count(x => x == "-drive") == 2 && !install.Contains("-fsdev") && !install.Contains("-virtfs"), "Unexpected drives or shared folders");
             Require(Option(install, "-boot") == "order=c,once=d,menu=on" && Option(install, "-nic") == "none" && !install.Contains("-netdev"), "Installer not isolated");
             var normal = Qemu.BuildArguments(settings, disk, null, 5601, false);
             Require(normal.Count(x => x == "-drive") == 1 && Option(normal, "-boot") == "order=c", "Normal boot includes installer media");
@@ -111,22 +125,107 @@ namespace AndroidEmu.Verification
             Require(Option(normal, "-qmp") == "stdio" && Option(normal, "-monitor") == "none", "QEMU management not private");
         }
 
+        private static void DiskPathValidation()
+        {
+            var folder = Directory.CreateDirectory(Path.Combine(root, "Выбранная папка, 1")).FullName;
+            var disk = Path.Combine(folder, "Android 1.QCOW2");
+            Require(VirtualDisk.CheckDestination(disk) == disk, "Local custom filename was not accepted");
+            Throws<InvalidDataException>(() => VirtualDisk.NormalizePath("relative.qcow2"));
+            Throws<InvalidDataException>(() => VirtualDisk.NormalizePath(Path.Combine(folder, "disk.img")));
+            Throws<DirectoryNotFoundException>(() => VirtualDisk.CheckDestination(Path.Combine(folder, "missing", "disk.qcow2")));
+            if (Path.DirectorySeparatorChar == '\\')
+            {
+                foreach (var badPath in new[] { @"\\.\PhysicalDrive0", @"\\.\anything.qcow2", @"\\?\C:\disk.qcow2",
+                    @"\\server\share\disk.qcow2", @"C:disk.qcow2", @"C:\disk.qcow2:stream.qcow2", @"C:\temp\NUL.test.qcow2" })
+                    Throws<InvalidDataException>(() => VirtualDisk.NormalizePath(badPath));
+            }
+        }
+
         private static async Task DiskCreation()
         {
-            var dest = Path.Combine(root, "disks", "d.qcow2");
+            var folder = Directory.CreateDirectory(Path.Combine(root, "Диски, Android")).FullName;
+            var dest = Path.Combine(folder, "Мой диск.qcow2");
             var runner = new FakeRunner((exe, args) =>
             {
-                Require(exe == "qemu-img.exe" && args.SequenceEqual(new[] { "create", "-f", "qcow2", dest, "32G" }), "Unexpected qemu-img args");
-                File.WriteAllBytes(dest, new byte[] { 1, 2, 3 });
+                Require(exe == "qemu-img.exe" && args.Length == 5 && args.Take(3).SequenceEqual(new[] { "create", "-f", "qcow2" }) &&
+                    args[4] == "32G", "Unexpected qemu-img args");
+                Require(Path.GetDirectoryName(args[3]) == folder && args[3] != dest && !File.Exists(dest), "qemu-img sees the destination instead of a staging file");
+                File.WriteAllBytes(args[3], QcowHeader());
                 return Ok();
             });
-            await IsoInstaller.CreateDiskAsync(runner, "qemu-img.exe", dest, 32, CancellationToken.None);
-            await ThrowsAsync<IOException>(() => IsoInstaller.CreateDiskAsync(runner, "qemu-img.exe", dest, 32, CancellationToken.None));
-            Require(runner.Calls.Count == 1 && File.ReadAllBytes(dest).SequenceEqual(new byte[] { 1, 2, 3 }), "Existing disk overwritten");
-            var failedDest = Path.Combine(root, "disks", "failed.qcow2");
-            var failed = new FakeRunner((exe, args) => new CommandResult(1, "", "no space"));
-            await ThrowsAsync<IOException>(() => IsoInstaller.CreateDiskAsync(failed, "qemu-img.exe", failedDest, 32, CancellationToken.None));
-            Require(!File.Exists(failedDest), "Partial disk left after failure");
+            await VirtualDisk.CreateAsync(runner, "qemu-img.exe", dest, 32, CancellationToken.None);
+            Require(VirtualDisk.CheckForQemu(dest) == dest, "QEMU did not get the selected disk path");
+            await ThrowsAsync<IOException>(() => VirtualDisk.CreateAsync(runner, "qemu-img.exe", dest, 32, CancellationToken.None));
+            Require(runner.Calls.Count == 1 && File.ReadAllBytes(dest).SequenceEqual(QcowHeader()), "Existing disk overwritten");
+            var failedDest = Path.Combine(folder, "failed.qcow2");
+            var failed = new FakeRunner((exe, args) =>
+            {
+                File.WriteAllBytes(args[3], new byte[] { 1, 2, 3 });
+                return new CommandResult(1, "", "no space");
+            });
+            await ThrowsAsync<IOException>(() => VirtualDisk.CreateAsync(failed, "qemu-img.exe", failedDest, 32, CancellationToken.None));
+            Require(!File.Exists(failedDest) && Directory.GetFiles(folder).SequenceEqual(new[] { dest }), "Partial image or staging file left behind");
+        }
+
+        private static async Task DiskCollision()
+        {
+            var folder = Directory.CreateDirectory(Path.Combine(root, "collision")).FullName;
+            var dest = Path.Combine(folder, "disk.qcow2");
+            var original = new byte[] { 7, 9, 10 };
+            var runner = new FakeRunner((exe, args) =>
+            {
+                File.WriteAllBytes(args[3], QcowHeader());
+                File.WriteAllBytes(dest, original); // A different program created the chosen name in the meantime.
+                return Ok();
+            });
+            await ThrowsAsync<IOException>(() => VirtualDisk.CreateAsync(runner, "qemu-img.exe", dest, 32, CancellationToken.None));
+            Require(File.ReadAllBytes(dest).SequenceEqual(original), "The concurrently created file was overwritten or removed");
+            Require(Directory.GetFiles(folder).SequenceEqual(new[] { dest }), "Staging file left after collision");
+        }
+
+        private static async Task DiskCancellation()
+        {
+            var folder = Directory.CreateDirectory(Path.Combine(root, "cancellation")).FullName;
+            var dest = Path.Combine(folder, "disk.qcow2");
+            using (var cancellation = new CancellationTokenSource())
+            {
+                var runner = new FakeRunner((exe, args) =>
+                {
+                    File.WriteAllBytes(args[3], QcowHeader());
+                    cancellation.Cancel();
+                    return Ok();
+                });
+                await ThrowsAsync<OperationCanceledException>(() => VirtualDisk.CreateAsync(runner, "qemu-img.exe", dest, 32, cancellation.Token));
+                Require(!Directory.GetFiles(folder).Any(), "Cancelled creation left a destination or staging file");
+            }
+        }
+
+        private static void StandaloneImageValidation()
+        {
+            var path = Path.Combine(root, "standalone.qcow2");
+            var header = QcowHeader();
+            File.WriteAllBytes(path, header);
+            Require(VirtualDisk.CheckForQemu(path) == path, "Standalone QCOW2 not recognized");
+            header[15] = 104;
+            File.WriteAllBytes(path, header);
+            Throws<InvalidDataException>(() => VirtualDisk.CheckForQemu(path));
+            header[15] = 0;
+            header[79] = 4;
+            File.WriteAllBytes(path, header);
+            Throws<InvalidDataException>(() => VirtualDisk.CheckForQemu(path));
+            File.WriteAllBytes(path, new byte[104]);
+            Throws<InvalidDataException>(() => VirtualDisk.CheckForQemu(path));
+        }
+
+        private static byte[] QcowHeader()
+        {
+            var header = new byte[104];
+            header[0] = (byte)'Q';
+            header[1] = (byte)'F';
+            header[2] = (byte)'I';
+            header[3] = 0xfb;
+            header[7] = 3;
+            return header;
         }
 
         private static void WindowsQuoting()

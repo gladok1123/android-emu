@@ -13,6 +13,8 @@ namespace AndroidEmu.Core
         [DataMember] public string Id { get; set; }
         [DataMember] public string Name { get; set; }
         [DataMember] public int SizeGiB { get; set; }
+        /// <summary>Null for disks stored in the app directory by v0.3.0.</summary>
+        [DataMember(EmitDefaultValue = false)] public string FilePath { get; set; }
 
         public override string ToString() => Name + "  ·  " + SizeGiB + " ГиБ";
     }
@@ -64,6 +66,8 @@ namespace AndroidEmu.Core
             if (Disks == null || Disks.Any(d => d == null || !Guid.TryParseExact(d.Id, "N", out _) ||
                     string.IsNullOrWhiteSpace(d.Name) || !ValidDiskSize(d.SizeGiB)))
                 throw new InvalidDataException("В настройках есть некорректная запись о диске Android.");
+            foreach (var disk in Disks)
+                if (disk.FilePath != null) VirtualDisk.NormalizePath(disk.FilePath);
             if (Disks.Select(d => d.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count() != Disks.Count ||
                 (ActiveDiskId != null && ActiveDisk == null))
                 throw new InvalidDataException("Некорректный список дисков Android.");
@@ -103,7 +107,7 @@ namespace AndroidEmu.Core
                     return settings;
                 }
             }
-            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is SerializationException)
+            catch (Exception e) when (e is IOException || e is InvalidDataException || e is UnauthorizedAccessException || e is SerializationException)
             {
                 throw new IOException("Не удалось прочитать настройки: " + settingsFile + "\n" + e.Message, e);
             }
@@ -136,7 +140,9 @@ namespace AndroidEmu.Core
         {
             if (!Guid.TryParseExact(disk.Id, "N", out var id))
                 throw new InvalidDataException("Некорректный идентификатор диска.");
-            return Path.Combine(root, "disks", id.ToString("N") + ".qcow2");
+            return disk.FilePath == null
+                ? Path.Combine(root, "disks", id.ToString("N") + ".qcow2")
+                : VirtualDisk.NormalizePath(disk.FilePath);
         }
 
         public static void TryDelete(string path)

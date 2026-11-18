@@ -29,6 +29,7 @@ namespace AndroidEmu
         private bool refreshingDisks;
         private CancellationTokenSource operationCancellation;
         private string lastLog;
+        private string lastDiskDirectory;
 
         private readonly TabControl tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(22, 8) };
         private readonly Label vmStatus = TextLabel("", 10, FontStyle.Bold);
@@ -37,9 +38,14 @@ namespace AndroidEmu
         private readonly ComboBox systems = new ComboBox { Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList };
         private readonly NumericUpDown diskSize = Number(AppSettings.MinDiskSize, AppSettings.MaxDiskSize, 32);
         private readonly Button installSystem = ActionButton("Установить из ISO…", true, 203);
+        private readonly Button createDisk = ActionButton("Создать пустой диск…", false, 203);
         private readonly Button startVm = ActionButton("Запустить Android", true, 184);
         private readonly Button stopVm = ActionButton("Выключить", false, 115);
         private readonly Label diskHint = TextLabel("", 10);
+        private readonly TextBox diskFile = new TextBox
+        {
+            Dock = DockStyle.Fill, ReadOnly = true, AccessibleName = "Путь к файлу виртуального диска"
+        };
         private readonly ListBox packages = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, BorderStyle = BorderStyle.FixedSingle };
         private readonly Button installApk = ActionButton("Установить и открыть APK…", true, 240);
         private readonly Button openApk = ActionButton("Открыть выбранное", false, 184);
@@ -141,22 +147,25 @@ namespace AndroidEmu
             Row(installed, TextLabel("Активная система", 10), 24);
             Row(installed, systems, 35);
             Row(installed, Actions(startVm, stopVm), 44);
+            Row(installed, TextLabel("Файл диска для QEMU", 10), 24);
+            Row(installed, diskFile, 32);
             diskHint.ForeColor = Muted;
             diskHint.TextAlign = ContentAlignment.TopLeft;
-            Row(installed, diskHint, 79);
+            Row(installed, diskHint, 52);
             var setup = Card();
-            Row(setup, TextLabel("Установка из образа", 14, FontStyle.Bold), 37);
-            Row(setup, TextLabel("Формат: загрузочный ISO x86/x86_64 для Legacy BIOS.\n" +
-                "Для ARM-приложений нужен образ с Native Bridge.", 10), 57);
-            Row(setup, Actions(TextLabel("Размер диска, ГиБ", 10), diskSize), 39);
-            Row(setup, Actions(installSystem), 44);
-            Row(setup, TextLabel("Установщик откроется в отдельном окне QEMU.\nФизические диски не подключаются.", 10), 59);
+            Row(setup, TextLabel("Новый виртуальный диск", 14, FontStyle.Bold), 37);
+            Row(setup, TextLabel("Выберите, где создать файл QCOW2. Физические диски и общие папки в QEMU не подключаются.", 10), 50);
+            Row(setup, Actions(TextLabel("Размер диска, ГиБ", 10), diskSize), 37);
+            Row(setup, Actions(installSystem), 41);
+            Row(setup, Actions(createDisk), 41);
+            Row(setup, TextLabel("Для установки нужен ISO x86/x86_64 с Legacy BIOS.", 9), 37);
             columns.Controls.Add(installed, 0, 0);
             columns.Controls.Add(setup, 1, 0);
             Row(page, columns, fill: true);
 
             systems.SelectedIndexChanged += (_, __) => SelectSystem();
             installSystem.Click += async (_, __) => await PickIsoAsync();
+            createDisk.Click += async (_, __) => await CreateEmptyDiskAsync();
             startVm.Click += async (_, __) => await RunAsync("Запускаем Android…", true, async token => { await EnsureVmAsync(token); });
             stopVm.Click += async (_, __) => await RunAsync("Выключаем Android…", false, async token => { await StopAndroidAsync(); });
         }
@@ -317,10 +326,11 @@ namespace AndroidEmu
             vmStatus.Text = running ? (installing ? "●  УСТАНОВКА ANDROID" : vm.HasWhpx ? "●  ANDROID  /  WHPX" : "●  ANDROID  /  TCG") : "○  ANDROID ВЫКЛЮЧЕН";
             systems.Enabled = !busy && !running && systems.Items.Count > 0;
             installSystem.Enabled = !busy && !running;
+            createDisk.Enabled = !busy && !running;
             diskSize.Enabled = !busy && !running;
             startVm.Enabled = !busy && !running && settings.ActiveDisk != null;
-            stopVm.Enabled = !busy && running && !installing;
-            installApk.Enabled = !busy && settings.ActiveDisk != null;
+            stopVm.Enabled = !busy && running;
+            installApk.Enabled = !busy && !installing && settings.ActiveDisk != null;
             refreshApps.Enabled = !busy && running && !installing;
             openApk.Enabled = !busy && running && !installing && packages.SelectedIndex >= 0;
             saveSettings.Enabled = !busy;
@@ -328,9 +338,11 @@ namespace AndroidEmu
             armStatus.Enabled = !busy && running && !installing;
             probe.Enabled = !busy;
             cancel.Enabled = operationCancellation != null && !operationCancellation.IsCancellationRequested;
-            diskHint.Text = settings.ActiveDisk == null
-                ? "Системы пока нет. Выберите ISO справа, чтобы создать виртуальный диск."
-                : "Система загружается с диска QCOW2. Чтобы выбрать другой диск, сначала выключите Android.";
+            var disk = settings.ActiveDisk;
+            diskFile.Text = disk == null ? "" : store.DiskPath(disk);
+            diskHint.Text = disk == null
+                ? "Системы пока нет. Начните с установки из ISO."
+                : "Скопируйте путь, если хотите указать диск в QEMU вручную. Не открывайте его в двух машинах одновременно.";
         }
 
         private void RefreshDisks()
@@ -356,7 +368,7 @@ namespace AndroidEmu
                 status.Text = "Выбрана система «" + disk.Name + "».";
             });
             RefreshDisks();
-            UpdateControls();
+            RefreshDiagnostics();
         }
 
         private void Persist(AppSettings next)
@@ -389,6 +401,69 @@ namespace AndroidEmu
                 if (dialog.ShowDialog(this) == DialogResult.OK) field.Text = dialog.FileName;
         }
 
+        private string PickNewDiskPath(string suggestedName)
+        {
+            var active = settings.ActiveDisk;
+            var startingFolder = lastDiskDirectory ?? (active == null ? null : Path.GetDirectoryName(store.DiskPath(active)));
+            using (var dialog = new SaveFileDialog
+            {
+                Title = "Где создать виртуальный диск QEMU?",
+                Filter = "Виртуальный диск QEMU (*.qcow2)|*.qcow2",
+                DefaultExt = "qcow2",
+                AddExtension = true,
+                CheckPathExists = true,
+                RestoreDirectory = true,
+                OverwritePrompt = false, // Existing files are rejected, never offered for replacement.
+                InitialDirectory = Directory.Exists(startingFolder) ? startingFolder : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                FileName = suggestedName
+            })
+            {
+                string destination = null;
+                dialog.FileOk += (_, e) =>
+                {
+                    destination = null;
+                    try
+                    {
+                        var path = VirtualDisk.CheckDestination(dialog.FileName);
+                        if (settings.Disks.Any(d => string.Equals(store.DiskPath(d), path, StringComparison.OrdinalIgnoreCase)))
+                            throw new IOException("Этот путь уже связан с системой. Выберите другое имя файла.");
+                        destination = path;
+                    }
+                    catch (Exception error) when (error is IOException || error is InvalidDataException || error is ArgumentException ||
+                        error is UnauthorizedAccessException || error is NotSupportedException)
+                    {
+                        e.Cancel = true;
+                        MessageBox.Show(this, error.Message, "Виртуальный диск", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                };
+                if (dialog.ShowDialog(this) != DialogResult.OK || destination == null) return null;
+                lastDiskDirectory = Path.GetDirectoryName(destination);
+                return destination;
+            }
+        }
+
+        private async Task CreateEmptyDiskAsync()
+        {
+            var path = PickNewDiskPath("android.qcow2");
+            if (path == null) return;
+            var size = (int)diskSize.Value;
+            await RunAsync("Создаём пустой диск QCOW2…", true, async token =>
+            {
+                var qemuImg = ToolPaths.FindQemuImg(ToolPaths.FindQemu(settings));
+                await VirtualDisk.CreateAsync(runner, qemuImg, path, size, token);
+                status.Text = "Пустой диск создан. Его можно выбрать в QEMU.";
+                if (MessageBox.Show(this, "Готов пустой диск на " + size + " ГиБ:\n\n" + path +
+                    "\n\nВыберите этот файл как виртуальный жёсткий диск в QEMU. Скопировать путь?",
+                    "Виртуальный диск создан", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
+                try { Clipboard.SetText(path); }
+                catch (System.Runtime.InteropServices.ExternalException)
+                {
+                    MessageBox.Show(this, "Буфер обмена занят. Диск уже создан:\n" + path, "Виртуальный диск",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            });
+        }
+
         private async Task PickIsoAsync()
         {
             string iso;
@@ -397,66 +472,67 @@ namespace AndroidEmu
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
                 iso = dialog.FileName;
             }
+            var stem = Path.GetFileNameWithoutExtension(iso);
+            var path = PickNewDiskPath(string.IsNullOrWhiteSpace(stem) ? "android.qcow2" : stem + ".qcow2");
+            if (path == null) return;
             var size = (int)diskSize.Value;
-            if (MessageBox.Show(this, "Будет создан новый диск QCOW2 до " + size + " ГиБ.\n\n" +
-                "В окне QEMU выберите Installation, установите Android на единственный виртуальный диск и установите загрузчик для Legacy BIOS. " +
-                "После завершения выключите Android или закройте окно QEMU, затем сохраните диск в этом окне.\n\nПродолжить?",
+            if (MessageBox.Show(this, "Будет создан новый файл QCOW2 до " + size + " ГиБ:\n" + path + "\n\n" +
+                "В окне QEMU выберите Installation и единственный виртуальный жёсткий диск этого размера. " +
+                "Физические диски и общие папки в установщике не видны. Установите загрузчик для Legacy BIOS, затем закройте окно QEMU.\n\nПродолжить?",
                 "Установка Android", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
-            await RunAsync("Создаём виртуальный диск и запускаем установщик…", true, token => InstallIsoAsync(iso, size, token));
+            await RunAsync("Создаём виртуальный диск и запускаем установщик…", true, token => InstallIsoAsync(iso, path, size, token));
         }
 
-        private async Task InstallIsoAsync(string iso, int size, CancellationToken token)
+        private async Task InstallIsoAsync(string iso, string path, int size, CancellationToken token)
         {
             IsoInstaller.CheckIso(iso);
             var qemuExe = ToolPaths.FindQemu(settings);
             var imgExe = ToolPaths.FindQemuImg(qemuExe);
-            var disk = new AndroidDisk { Id = Guid.NewGuid().ToString("N"), Name = Path.GetFileNameWithoutExtension(iso), SizeGiB = size };
+            var disk = new AndroidDisk
+            {
+                Id = Guid.NewGuid().ToString("N"), Name = Path.GetFileNameWithoutExtension(path), SizeGiB = size, FilePath = path
+            };
             if (settings.Disks.Any(d => d.Name == disk.Name)) disk.Name += " · " + disk.Id.Substring(0, 6);
-            var path = store.DiskPath(disk);
-            await IsoInstaller.CreateDiskAsync(runner, imgExe, path, size, token);
+            await VirtualDisk.CreateAsync(runner, imgExe, path, size, token);
             VmSession session = null;
-            bool keep = false;
             try
             {
                 installing = true;
                 session = await Qemu.StartAsync(qemuExe, settings, path, iso, store.LogsDirectory, token);
                 vm = session;
                 lastLog = session.LogPath;
-                status.Text = "Установите Android в окне QEMU и закройте его после завершения.";
+                status.Text = "Установите Android на единственный виртуальный диск в QEMU, затем закройте окно QEMU.";
                 UpdateControls();
                 await WaitForExitAsync(session, token);
                 await session.DrainOutputAsync();
                 var code = await session.Exit;
                 if (code != 0) throw new IOException("QEMU завершился с ошибкой " + code + ".\n" + session.LastError + "\nЖурнал: " + lastLog);
                 if (MessageBox.Show(this, "Android установлен на виртуальный диск?\n\n" +
-                    "«Да» — сохранить диск и сделать его активным. «Нет» — удалить новый диск.",
+                    "«Да» — добавить диск в список и сделать активным. «Нет» — не добавлять; файл останется на месте.\n\n" + path,
                     "Завершение установки", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
                 {
-                    keep = true; // Preserve the installed disk even if writing settings fails.
                     var next = settings.Copy();
                     next.Disks.Add(disk);
                     next.ActiveDiskId = disk.Id;
-                    try { Persist(next); }
-                    catch (Exception e) { throw new IOException("Диск сохранён, но не добавлен в список: " + path + "\n" + e.Message, e); }
+                    Persist(next);
                     RefreshDisks();
-                    status.Text = "Диск сохранён. Нажмите «Запустить Android» для загрузки без ISO.";
+                    status.Text = "Диск добавлен. Нажмите «Запустить Android» для загрузки без ISO.";
                 }
-                else status.Text = "Новый виртуальный диск не сохранён.";
+                else status.Text = "Диск не добавлен в список. Файл остался по выбранному пути.";
+            }
+            catch (Exception error) when (!(error is OperationCanceledException))
+            {
+                throw new IOException(error.Message + "\n\nСозданный файл диска оставлен по пути:\n" + path, error);
             }
             finally
             {
-                if (session != null)
+                if (session == null || await session.StopAsync(force: true))
                 {
-                    if (await session.StopAsync(force: true)) session.Dispose();
-                    else
-                    {
-                        keep = true;
-                        ObserveVm(session);
-                    }
+                    session?.Dispose();
+                    vm = null;
+                    installing = false;
                 }
-                installing = false;
-                if (!keep) SettingsStore.TryDelete(path);
-                if (session == null || session.Exit.IsCompleted) vm = null;
+                else ObserveVm(session);
                 RefreshDiagnostics();
             }
         }
@@ -497,6 +573,7 @@ namespace AndroidEmu
             session.Dispose();
             if (!ReferenceEquals(vm, session) || IsDisposed) return;
             vm = null;
+            installing = false;
             packages.Items.Clear();
             if (!busy) status.Text = exit == 0 ? "Android выключен." : "QEMU завершился с кодом " + exit + ". Откройте журналы в диагностике.";
             UpdateControls();
@@ -615,6 +692,7 @@ namespace AndroidEmu
                 "WHPX: " + (Hypervisor.IsAvailable() ? "доступна Windows" : "недоступна (компонент Windows, перезагрузка или VT-x/AMD-V в BIOS/UEFI)") + "\n" +
                 "Ускорение при запуске: " + (settings.ForceSoftware ? "TCG (выбрано в настройках)" : "авто (WHPX / TCG)") + "\n" +
                 "Система: " + (settings.ActiveDisk?.Name ?? "не установлена") + "\n" +
+                (settings.ActiveDisk == null ? "" : "Файл диска: " + store.DiskPath(settings.ActiveDisk) + "\n") +
                 (vm == null || installing || vm.Exit.IsCompleted ? "" : "ADB-устройство: 127.0.0.1:" + vm.AdbPort + "\n") +
                 (lastLog == null ? "" : "Последний журнал QEMU: " + lastLog + "\n") +
                 "\n" + (guest == null ? "Чтобы узнать ABI, запустите Android и нажмите «Проверить ARM»." : guest) + "\n\n" + Adb.ArmHint;
@@ -654,7 +732,7 @@ namespace AndroidEmu
         {
             var source = operationCancellation;
             if (source == null) return;
-            if (installing && MessageBox.Show(this, "Прервать установку? Новый виртуальный диск не будет сохранён.", "Отмена установки",
+            if (installing && MessageBox.Show(this, "Прервать установку? Созданный файл виртуального диска не будет удалён.", "Отмена установки",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             if (!ReferenceEquals(source, operationCancellation)) return;
             source.Cancel();
